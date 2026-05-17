@@ -10,17 +10,14 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 
-// --- SUPABASE CONFIGURATION ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
-if (!supabaseUrl || !supabaseKey) {
+if (!supabase) {
     console.error('ERROR: Missing SUPABASE_URL or SUPABASE_KEY in .env');
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// --- MQTT CONFIGURATION ---
 const SENSOR_TOPIC_FILTER = process.env.MQTT_SENSOR_TOPIC || 'wokwi/sensors/#';
 const SENSOR_DATA_TOPIC = process.env.MQTT_SENSOR_DATA_TOPIC || 'wokwi/sensors/data';
 const COMMAND_TOPIC = process.env.MQTT_COMMAND_TOPIC || 'wokwi/sensors/commands';
@@ -31,7 +28,7 @@ const mqttOptions = {
     protocol: (process.env.MQTT_BROKER && process.env.MQTT_BROKER.includes('hivemq.cloud')) ? 'mqtts' : 'mqtt',
     username: process.env.MQTT_USERNAME,
     password: process.env.MQTT_PASSWORD,
-    clientId: process.env.MQTT_CLIENT_ID || ('backend_' + Math.random().toString(16).substr(2, 8)),
+    clientId: process.env.MQTT_CLIENT_ID || ('backend_' + Math.random().toString(16).slice(2, 10)),
     rejectUnauthorized: false
 };
 
@@ -53,6 +50,19 @@ let latestSensorData = {
     updatedAt: null
 };
 
+let latestAlert = null;
+const alertHistory = [];
+
+let latestSupabaseStatus = {
+    connected: false,
+    error: supabase ? null : 'Thiếu SUPABASE_URL hoặc SUPABASE_KEY',
+    checkedAt: null
+};
+let lastSupabaseCheckMs = 0;
+
+const INACTIVE_ALERT_VALUES = new Set(['0', 'false', 'no', 'none', 'ok', 'safe', 'normal', 'off']);
+const ACTIVE_ALERT_VALUES = new Set(['1', 'true', 'yes', 'danger', 'alert', 'warning', 'fire', 'gas', 'temp', 'temperature', 'humidity']);
+
 function firstDefined(...values) {
     return values.find((value) => value !== undefined && value !== null);
 }
@@ -63,13 +73,13 @@ function toNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
-function normalizeSensorPayload(data) {
+function normalizeSensorPayload(data = {}) {
     return {
         temperature: toNumber(firstDefined(data.temp, data.temperature, data.t)),
         humidity: toNumber(firstDefined(data.humi, data.humidity, data.hum, data.h)),
         gas: toNumber(firstDefined(data.gas, data.gasValue, data.gas_value)),
         fire: firstDefined(data.fire, data.flame, data.isFire),
-        alert: firstDefined(data.alert),
+        alert: firstDefined(data.alert, data.warning, data.alarm),
         thresholds: {
             temperature: toNumber(firstDefined(data.th_temp, data.temp_threshold, data.tempThreshold)),
             humidity: toNumber(firstDefined(data.th_humidity, data.th_hum, data.humidity_threshold, data.humidityThreshold)),
@@ -77,6 +87,84 @@ function normalizeSensorPayload(data) {
         },
         raw: data
     };
+}
+
+function alertText(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function hasAlertValue(value) {
+    return value !== undefined && value !== null && String(value).trim() !== '';
+}
+
+function isInactiveAlertValue(value) {
+    return hasAlertValue(value) && INACTIVE_ALERT_VALUES.has(alertText(value));
+}
+
+function isActiveAlertValue(value) {
+    if (!hasAlertValue(value)) return false;
+    const text = alertText(value);
+    return ACTIVE_ALERT_VALUES.has(text) || !INACTIVE_ALERT_VALUES.has(text);
+}
+
+function isTruthy(value) {
+    return value === true || value === 1 || ACTIVE_ALERT_VALUES.has(alertText(value));
+}
+
+function addIssue(issues, type, message) {
+    issues.push({ type, message });
+}
+
+function buildAlertFromPayload(topic, data, rawData) {
+    const issues = [];
+    const thresholds = data.thresholds || {};
+    const hasExplicitAlert = hasAlertValue(data.alert);
+    const alertIsActive = isActiveAlertValue(data.alert);
+
+    if (hasExplicitAlert && !alertIsActive) return null;
+
+    if (isTruthy(data.fire)) {
+        addIssue(issues, 'fire', 'Phát hiện lửa hoặc tín hiệu cháy');
+    }
+    if (data.temperature !== null && thresholds.temperature !== null && data.temperature >= thresholds.temperature) {
+        addIssue(issues, 'temp', `Nhiệt độ ${data.temperature}°C vượt ngưỡng ${thresholds.temperature}°C`);
+    }
+    if (data.gas !== null && thresholds.gas !== null && data.gas >= thresholds.gas) {
+        addIssue(issues, 'gas', `Gas ${Math.round(data.gas)} ppm vượt ngưỡng ${Math.round(thresholds.gas)} ppm`);
+    }
+    if (data.humidity !== null && thresholds.humidity !== null && data.humidity >= thresholds.humidity) {
+        addIssue(issues, 'humi', `Độ ẩm ${data.humidity}% vượt ngưỡng ${thresholds.humidity}%`);
+    }
+    if (alertIsActive) {
+        addIssue(issues, 'sensor', `Wokwi gửi cảnh báo: ${data.alert}`);
+    }
+    if (topic.includes('alert') && issues.length === 0) {
+        addIssue(issues, 'sensor', `Có cảnh báo từ topic ${topic}`);
+    }
+
+    if (issues.length === 0) return null;
+
+    return {
+        topic,
+        message: issues.map((issue) => issue.message).join('. '),
+        issues,
+        raw: rawData,
+        updatedAt: new Date().toISOString()
+    };
+}
+
+function rememberAlert(alert) {
+    if (!alert) return;
+    latestAlert = alert;
+    alertHistory.unshift(alert);
+    if (alertHistory.length > 50) alertHistory.pop();
+    console.log(`ALERT received on ${alert.topic}: ${alert.message}`);
+}
+
+function clearLatestAlertIfNormal(data) {
+    if (isInactiveAlertValue(data.alert)) {
+        latestAlert = null;
+    }
 }
 
 function buildControlPayload({ device, value, values }) {
@@ -95,17 +183,51 @@ function buildControlPayload({ device, value, values }) {
     const numericValue = toNumber(value);
     if (numericValue === null) return null;
 
-    if (device === 'gas_threshold') {
-        return { set_gas: Math.round(numericValue) };
-    }
-    if (device === 'temp_threshold') {
-        return { set_temp: numericValue };
-    }
-    if (device === 'humi_threshold' || device === 'humidity_threshold') {
-        return { set_humidity: numericValue };
-    }
+    if (device === 'gas_threshold') return { set_gas: Math.round(numericValue) };
+    if (device === 'temp_threshold') return { set_temp: numericValue };
+    if (device === 'humi_threshold' || device === 'humidity_threshold') return { set_humidity: numericValue };
 
     return null;
+}
+
+async function checkSupabaseStatus(force = false) {
+    if (!supabase) {
+        latestSupabaseStatus = {
+            connected: false,
+            error: 'Thiếu SUPABASE_URL hoặc SUPABASE_KEY',
+            checkedAt: new Date().toISOString()
+        };
+        return latestSupabaseStatus;
+    }
+
+    const now = Date.now();
+    if (!force && latestSupabaseStatus.checkedAt && now - lastSupabaseCheckMs < 10000) {
+        return latestSupabaseStatus;
+    }
+
+    lastSupabaseCheckMs = now;
+    try {
+        const { error } = await supabase
+            .from('stroke_events')
+            .select('*', { count: 'exact', head: true });
+
+        if (error) throw error;
+
+        latestSupabaseStatus = {
+            connected: true,
+            error: null,
+            checkedAt: new Date().toISOString()
+        };
+    } catch (err) {
+        latestSupabaseStatus = {
+            connected: false,
+            error: err.message,
+            checkedAt: new Date().toISOString()
+        };
+        console.error('Supabase Health Error:', err.message);
+    }
+
+    return latestSupabaseStatus;
 }
 
 mqttClient.on('connect', () => {
@@ -124,20 +246,46 @@ mqttClient.on('message', (topic, message) => {
 
     if (topic === SENSOR_DATA_TOPIC) {
         try {
-            const data = JSON.parse(text);
+            const payload = JSON.parse(text);
+            const normalizedData = normalizeSensorPayload(payload);
             latestSensorData = {
                 ...latestSensorData,
-                ...normalizeSensorPayload(data),
+                ...normalizedData,
                 topic,
                 updatedAt: new Date().toISOString()
             };
+
+            const alert = buildAlertFromPayload(topic, normalizedData, payload);
+            if (alert) {
+                rememberAlert(alert);
+            } else {
+                clearLatestAlertIfNormal(normalizedData);
+            }
         } catch (err) {
             console.error('Invalid sensor payload:', err.message);
         }
+        return;
     }
 
     if (topic.includes('alert')) {
-        console.log(`ALERT received on ${topic}: ${text}`);
+        try {
+            const payload = JSON.parse(text);
+            const normalizedData = normalizeSensorPayload(payload);
+            const alert = buildAlertFromPayload(topic, normalizedData, payload);
+            if (alert) {
+                rememberAlert(alert);
+            } else {
+                clearLatestAlertIfNormal(normalizedData);
+            }
+        } catch (err) {
+            rememberAlert({
+                topic,
+                message: text,
+                issues: [{ type: 'sensor', message: text }],
+                raw: text,
+                updatedAt: new Date().toISOString()
+            });
+        }
     }
 });
 
@@ -145,40 +293,61 @@ mqttClient.on('error', (err) => {
     console.error('MQTT Error:', err.message);
 });
 
-// --- API ROUTES ---
-
-// 1. Get images from Supabase (Limit 11 to have 1 latest + 10 history)
 app.get('/api/images', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chưa được cấu hình' });
+    }
+
     try {
         const { data, error } = await supabase
             .from('stroke_events')
             .select('*')
-            .order('timestamp', { ascending: false })
+            .order('timestamp', { ascending: false, nullsFirst: false })
+            .order('id', { ascending: false })
             .limit(11);
 
         if (error) throw error;
+
+        latestSupabaseStatus = {
+            connected: true,
+            error: null,
+            checkedAt: new Date().toISOString()
+        };
         res.json(data);
     } catch (err) {
+        latestSupabaseStatus = {
+            connected: false,
+            error: err.message,
+            checkedAt: new Date().toISOString()
+        };
         console.error('Supabase Error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 2. Latest sensor data received by the backend MQTT client
 app.get('/api/sensors/latest', (req, res) => {
     res.json(latestSensorData);
 });
 
-// 3. Control & Threshold Settings
+app.get('/api/alerts/latest', (req, res) => {
+    res.json({ latestAlert, alertHistory });
+});
+
+app.get('/api/supabase/health', async (req, res) => {
+    res.json(await checkSupabaseStatus(true));
+});
+
 app.post('/api/control', (req, res) => {
     const payloadObj = buildControlPayload(req.body);
 
     if (!payloadObj || Object.keys(payloadObj).length === 0) {
-        return res.status(400).json({ error: 'Invalid or unsupported threshold command' });
+        return res.status(400).json({ error: 'Lệnh ngưỡng không hợp lệ hoặc chưa được hỗ trợ' });
     }
 
     if (!mqttClient.connected) {
-        return res.status(503).json({ error: 'MQTT client is not connected' });
+        return res.status(503).json({ error: 'MQTT client chưa kết nối' });
     }
 
     const payload = JSON.stringify(payloadObj);
@@ -193,13 +362,15 @@ app.post('/api/control', (req, res) => {
     });
 });
 
-// 4. Health Check
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+    const supabaseStatus = await checkSupabaseStatus();
     res.json({
         status: 'online',
         mqtt: mqttClient.connected,
-        supabase: !!supabase,
+        supabase: supabaseStatus.connected,
+        supabaseStatus,
         latestSensorData,
+        latestAlert,
         uptime: process.uptime()
     });
 });
