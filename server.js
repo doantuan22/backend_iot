@@ -11,16 +11,28 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
+const usesSupabaseServiceRole = !!process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 if (!supabase) {
     console.error('ERROR: Missing SUPABASE_URL or SUPABASE_KEY in .env');
+} else if (!usesSupabaseServiceRole) {
+    console.warn('WARNING: SUPABASE_SERVICE_ROLE_KEY is not set. Inserts/deletes can fail when Supabase RLS is enabled.');
 }
 
 const SENSOR_TOPIC_FILTER = process.env.MQTT_SENSOR_TOPIC || 'wokwi/sensors/#';
 const SENSOR_DATA_TOPIC = process.env.MQTT_SENSOR_DATA_TOPIC || 'wokwi/sensors/data';
 const COMMAND_TOPIC = process.env.MQTT_COMMAND_TOPIC || 'wokwi/sensors/commands';
+const SENSOR_DATA_TABLE = process.env.SENSOR_DATA_TABLE || 'sensor_data';
+const SENSOR_PERSIST_INTERVAL_MS = Number(process.env.SENSOR_PERSIST_INTERVAL_MS || 5 * 60 * 1000);
+const STROKE_EVENTS_TABLE = process.env.STROKE_EVENTS_TABLE || 'stroke_events';
+const SURVEILLANCE_BUCKET = process.env.SURVEILLANCE_BUCKET || 'surveillance-images';
+const DATABASE_TABLES = {
+    stroke_event: { table: STROKE_EVENTS_TABLE, timeColumn: 'timestamp', storageBucket: SURVEILLANCE_BUCKET },
+    stroke_events: { table: STROKE_EVENTS_TABLE, timeColumn: 'timestamp', storageBucket: SURVEILLANCE_BUCKET },
+    sensor_data: { table: SENSOR_DATA_TABLE, timeColumn: 'created_at' }
+};
 
 const mqttOptions = {
     host: process.env.MQTT_BROKER || 'broker.hivemq.com',
@@ -52,6 +64,17 @@ let latestSensorData = {
 
 let latestAlert = null;
 const alertHistory = [];
+let lastSensorPersistMs = 0;
+let sensorPersistInFlight = false;
+let latestSensorPersistStatus = {
+    saved: false,
+    skipped: false,
+    reason: 'No MQTT sensor data yet',
+    rows: 0,
+    lastSavedAt: null,
+    checkedAt: null,
+    error: null
+};
 
 let latestSupabaseStatus = {
     connected: false,
@@ -111,6 +134,11 @@ function isTruthy(value) {
     return value === true || value === 1 || ACTIVE_ALERT_VALUES.has(alertText(value));
 }
 
+function formatNumber(value, suffix = '') {
+    if (value === null || value === undefined) return '';
+    return `${Number.isInteger(value) ? value : Number(value.toFixed(1))}${suffix}`;
+}
+
 function addIssue(issues, type, message) {
     issues.push({ type, message });
 }
@@ -153,6 +181,142 @@ function buildAlertFromPayload(topic, data, rawData) {
     };
 }
 
+function buildWarningForSensor(sensorName, data) {
+    const warnings = [];
+    const thresholds = data.thresholds || {};
+
+    if (isTruthy(data.fire)) {
+        warnings.push('Phat hien lua hoac tin hieu chay');
+    }
+
+    if (sensorName === 'temperature' && data.temperature !== null && thresholds.temperature !== null && data.temperature >= thresholds.temperature) {
+        warnings.push(`Nhiet do ${formatNumber(data.temperature, 'C')} vuot nguong ${formatNumber(thresholds.temperature, 'C')}`);
+    }
+
+    if (sensorName === 'humidity' && data.humidity !== null && thresholds.humidity !== null && data.humidity >= thresholds.humidity) {
+        warnings.push(`Do am ${formatNumber(data.humidity, '%')} vuot nguong ${formatNumber(thresholds.humidity, '%')}`);
+    }
+
+    if (sensorName === 'gas' && data.gas !== null && thresholds.gas !== null && data.gas >= thresholds.gas) {
+        warnings.push(`Gas ${Math.round(data.gas)} ppm vuot nguong ${Math.round(thresholds.gas)} ppm`);
+    }
+
+    if (isActiveAlertValue(data.alert)) {
+        warnings.push(`Wokwi gui canh bao: ${data.alert}`);
+    }
+
+    return warnings.length > 0 ? warnings.join('. ') : null;
+}
+
+function buildSensorDataRows(data) {
+    const fireDetected = isTruthy(data.fire);
+
+    return [
+        {
+            sensor_name: 'temperature',
+            temperature: data.temperature,
+            humidity: null,
+            gas_value: null,
+            fire_detected: fireDetected,
+            warning: buildWarningForSensor('temperature', data)
+        },
+        {
+            sensor_name: 'humidity',
+            temperature: null,
+            humidity: data.humidity,
+            gas_value: null,
+            fire_detected: fireDetected,
+            warning: buildWarningForSensor('humidity', data)
+        },
+        {
+            sensor_name: 'gas',
+            temperature: null,
+            humidity: null,
+            gas_value: data.gas,
+            fire_detected: fireDetected,
+            warning: buildWarningForSensor('gas', data)
+        }
+    ];
+}
+
+function markSensorPersistStatus(update) {
+    latestSensorPersistStatus = {
+        ...latestSensorPersistStatus,
+        ...update,
+        checkedAt: new Date().toISOString()
+    };
+}
+
+async function persistSensorDataIfDue(data) {
+    if (!supabase) {
+        markSensorPersistStatus({
+            saved: false,
+            skipped: true,
+            reason: 'Supabase is not configured',
+            rows: 0,
+            error: 'Missing SUPABASE_URL or SUPABASE_KEY'
+        });
+        return latestSensorPersistStatus;
+    }
+
+    const now = Date.now();
+    const elapsedMs = now - lastSensorPersistMs;
+
+    if (sensorPersistInFlight) {
+        markSensorPersistStatus({
+            saved: false,
+            skipped: true,
+            reason: 'Previous sensor batch is still being saved',
+            rows: 0,
+            error: null
+        });
+        return latestSensorPersistStatus;
+    }
+
+    if (lastSensorPersistMs && elapsedMs < SENSOR_PERSIST_INTERVAL_MS) {
+        markSensorPersistStatus({
+            saved: false,
+            skipped: true,
+            reason: `Wait ${Math.ceil((SENSOR_PERSIST_INTERVAL_MS - elapsedMs) / 1000)} more seconds`,
+            rows: 0,
+            error: null
+        });
+        return latestSensorPersistStatus;
+    }
+
+    sensorPersistInFlight = true;
+    try {
+        const rows = buildSensorDataRows(data);
+        const { error } = await supabase.from(SENSOR_DATA_TABLE).insert(rows);
+
+        if (error) throw error;
+
+        lastSensorPersistMs = Date.now();
+        markSensorPersistStatus({
+            saved: true,
+            skipped: false,
+            reason: null,
+            rows: rows.length,
+            lastSavedAt: new Date(lastSensorPersistMs).toISOString(),
+            error: null
+        });
+        console.log(`Saved ${rows.length} sensor rows to ${SENSOR_DATA_TABLE}`);
+    } catch (err) {
+        markSensorPersistStatus({
+            saved: false,
+            skipped: false,
+            reason: null,
+            rows: 0,
+            error: err.message
+        });
+        console.error('Sensor Data Supabase Error:', err.message);
+    } finally {
+        sensorPersistInFlight = false;
+    }
+
+    return latestSensorPersistStatus;
+}
+
 function rememberAlert(alert) {
     if (!alert) return;
     latestAlert = alert;
@@ -190,6 +354,59 @@ function buildControlPayload({ device, value, values }) {
     return null;
 }
 
+function getDatabaseConfig(tableName) {
+    return DATABASE_TABLES[String(tableName || '').toLowerCase()] || null;
+}
+
+function applyDateFilters(query, timeColumn, start, end) {
+    let nextQuery = query;
+    if (start) nextQuery = nextQuery.gte(timeColumn, start);
+    if (end) nextQuery = nextQuery.lte(timeColumn, end);
+    return nextQuery;
+}
+
+function getStrokeImageUrl(row = {}) {
+    return firstDefined(row.image_url, row.imageUrl, row.url, row.image, row.path, row.file_path, row.filePath);
+}
+
+function getStoragePathFromUrl(value) {
+    if (!value) return null;
+
+    const text = String(value).trim();
+    if (!text) return null;
+
+    if (!/^https?:\/\//i.test(text)) {
+        return text.replace(/^\/+/, '');
+    }
+
+    try {
+        const url = new URL(text);
+        const decodedPath = decodeURIComponent(url.pathname);
+        const publicMarker = `/storage/v1/object/public/${SURVEILLANCE_BUCKET}/`;
+        const signedMarker = `/storage/v1/object/sign/${SURVEILLANCE_BUCKET}/`;
+        const marker = decodedPath.includes(publicMarker) ? publicMarker : signedMarker;
+        const index = decodedPath.indexOf(marker);
+
+        if (index === -1) return null;
+        return decodedPath.slice(index + marker.length).replace(/^\/+/, '');
+    } catch (err) {
+        return null;
+    }
+}
+
+async function deleteStrokeEventImage(row) {
+    const imagePath = getStoragePathFromUrl(getStrokeImageUrl(row));
+
+    if (!imagePath) {
+        return { deleted: false, path: null, reason: 'No storage path found on row' };
+    }
+
+    const { error } = await supabase.storage.from(SURVEILLANCE_BUCKET).remove([imagePath]);
+    if (error) throw error;
+
+    return { deleted: true, path: imagePath, reason: null };
+}
+
 async function checkSupabaseStatus(force = false) {
     if (!supabase) {
         latestSupabaseStatus = {
@@ -208,7 +425,7 @@ async function checkSupabaseStatus(force = false) {
     lastSupabaseCheckMs = now;
     try {
         const { error } = await supabase
-            .from('stroke_events')
+            .from(SENSOR_DATA_TABLE)
             .select('*', { count: 'exact', head: true });
 
         if (error) throw error;
@@ -261,6 +478,8 @@ mqttClient.on('message', (topic, message) => {
             } else {
                 clearLatestAlertIfNormal(normalizedData);
             }
+
+            persistSensorDataIfDue(normalizedData);
         } catch (err) {
             console.error('Invalid sensor payload:', err.message);
         }
@@ -302,7 +521,7 @@ app.get('/api/images', async (req, res) => {
 
     try {
         const { data, error } = await supabase
-            .from('stroke_events')
+            .from(STROKE_EVENTS_TABLE)
             .select('*')
             .order('timestamp', { ascending: false, nullsFirst: false })
             .order('id', { ascending: false })
@@ -328,7 +547,154 @@ app.get('/api/images', async (req, res) => {
 });
 
 app.get('/api/sensors/latest', (req, res) => {
-    res.json(latestSensorData);
+    res.json({
+        ...latestSensorData,
+        persistStatus: latestSensorPersistStatus
+    });
+});
+
+app.get('/api/sensors/history', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit || 30), 1), 300);
+
+    try {
+        const { data, error } = await supabase
+            .from(SENSOR_DATA_TABLE)
+            .select('*')
+            .order('created_at', { ascending: false })
+            .order('id', { ascending: false })
+            .limit(limit);
+
+        if (error) throw error;
+
+        res.json(data);
+    } catch (err) {
+        console.error('Sensor History Supabase Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/database/:table', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const config = getDatabaseConfig(req.params.table);
+    if (!config) {
+        return res.status(400).json({ error: 'Bang du lieu khong duoc ho tro' });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
+    const { start, end } = req.query;
+
+    try {
+        let query = supabase
+            .from(config.table)
+            .select('*', { count: 'exact' })
+            .order(config.timeColumn, { ascending: false, nullsFirst: false })
+            .order('id', { ascending: false })
+            .limit(limit);
+
+        query = applyDateFilters(query, config.timeColumn, start, end);
+
+        const { data, error, count } = await query;
+        if (error) throw error;
+
+        res.json({
+            table: config.table,
+            timeColumn: config.timeColumn,
+            rows: data || [],
+            count: count || 0
+        });
+    } catch (err) {
+        console.error('Database Query Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/database/:table/:id', async (req, res) => {
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const config = getDatabaseConfig(req.params.table);
+    if (!config) {
+        return res.status(400).json({ error: 'Bang du lieu khong duoc ho tro' });
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ error: 'ID khong hop le' });
+    }
+
+    try {
+        let storageResult = null;
+
+        if (config.table === STROKE_EVENTS_TABLE) {
+            const { data: row, error: fetchError } = await supabase
+                .from(config.table)
+                .select('*')
+                .eq('id', id)
+                .single();
+
+            if (fetchError) throw fetchError;
+            storageResult = await deleteStrokeEventImage(row);
+        }
+
+        const { data, error } = await supabase
+            .from(config.table)
+            .delete()
+            .eq('id', id)
+            .select('id');
+
+        if (error) throw error;
+
+        res.json({
+            deleted: data?.length || 0,
+            storage: storageResult
+        });
+    } catch (err) {
+        console.error('Database Delete Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/database/sensor_data', async (req, res) => {
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const { start, end } = req.body || {};
+    if (!start && !end) {
+        return res.status(400).json({ error: 'Can chon it nhat mot moc thoi gian de xoa sensor_data' });
+    }
+
+    try {
+        let query = supabase
+            .from(SENSOR_DATA_TABLE)
+            .delete()
+            .select('id');
+
+        query = applyDateFilters(query, 'created_at', start, end);
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        res.json({
+            table: SENSOR_DATA_TABLE,
+            deleted: data?.length || 0
+        });
+    } catch (err) {
+        console.error('Sensor Bulk Delete Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/alerts/latest', (req, res) => {
@@ -370,6 +736,7 @@ app.get('/api/health', async (req, res) => {
         supabase: supabaseStatus.connected,
         supabaseStatus,
         latestSensorData,
+        latestSensorPersistStatus,
         latestAlert,
         uptime: process.uptime()
     });
