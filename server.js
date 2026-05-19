@@ -66,6 +66,8 @@ let latestAlert = null;
 const alertHistory = [];
 let lastSensorPersistMs = 0;
 let sensorPersistInFlight = false;
+let sensorPersistQueue = Promise.resolve();
+let lastPersistedAlertKey = '';
 let latestSensorPersistStatus = {
     saved: false,
     skipped: false,
@@ -85,6 +87,7 @@ let lastSupabaseCheckMs = 0;
 
 const INACTIVE_ALERT_VALUES = new Set(['0', 'false', 'no', 'none', 'ok', 'safe', 'normal', 'off']);
 const ACTIVE_ALERT_VALUES = new Set(['1', 'true', 'yes', 'danger', 'alert', 'warning', 'fire', 'gas', 'temp', 'temperature', 'humidity']);
+const VIETNAM_TIME_OFFSET_MS = 7 * 60 * 60 * 1000;
 
 function firstDefined(...values) {
     return values.find((value) => value !== undefined && value !== null);
@@ -137,6 +140,14 @@ function isTruthy(value) {
 function formatNumber(value, suffix = '') {
     if (value === null || value === undefined) return '';
     return `${Number.isInteger(value) ? value : Number(value.toFixed(1))}${suffix}`;
+}
+
+function vietnamTimestamp(date = new Date()) {
+    return new Date(date.getTime() + VIETNAM_TIME_OFFSET_MS).toISOString().replace('Z', '');
+}
+
+function vietnamRangeTimestamp(date) {
+    return vietnamTimestamp(date);
 }
 
 function addIssue(issues, type, message) {
@@ -210,9 +221,11 @@ function buildWarningForSensor(sensorName, data) {
 
 function buildSensorDataRows(data) {
     const fireDetected = isTruthy(data.fire);
+    const createdAt = data.receivedAt || vietnamTimestamp();
 
     return [
         {
+            created_at: createdAt,
             sensor_name: 'temperature',
             temperature: data.temperature,
             humidity: null,
@@ -221,6 +234,7 @@ function buildSensorDataRows(data) {
             warning: buildWarningForSensor('temperature', data)
         },
         {
+            created_at: createdAt,
             sensor_name: 'humidity',
             temperature: null,
             humidity: data.humidity,
@@ -229,6 +243,7 @@ function buildSensorDataRows(data) {
             warning: buildWarningForSensor('humidity', data)
         },
         {
+            created_at: createdAt,
             sensor_name: 'gas',
             temperature: null,
             humidity: null,
@@ -247,7 +262,28 @@ function markSensorPersistStatus(update) {
     };
 }
 
-async function persistSensorDataIfDue(data) {
+function sensorAlertPersistKey(alert = {}, data = {}) {
+    const issueTypes = Array.isArray(alert.issues)
+        ? alert.issues.map((issue) => issue.type || 'sensor').sort().join('|')
+        : 'sensor';
+    const alertValue = alertText(firstDefined(data.alert, data.warning, data.alarm, alert.message));
+    return [alert.topic || '', issueTypes, alertValue].join('::');
+}
+
+function enqueueSensorPersist(data, options) {
+    sensorPersistQueue = sensorPersistQueue
+        .catch(() => null)
+        .then(() => persistSensorDataBatch(data, options));
+    return sensorPersistQueue;
+}
+
+async function persistSensorDataBatch(data, options = {}) {
+    const {
+        reason = 'Periodic sensor snapshot',
+        updatePeriodicClock = true,
+        alertKey = ''
+    } = options;
+
     if (!supabase) {
         markSensorPersistStatus({
             saved: false,
@@ -259,25 +295,20 @@ async function persistSensorDataIfDue(data) {
         return latestSensorPersistStatus;
     }
 
-    const now = Date.now();
-    const elapsedMs = now - lastSensorPersistMs;
+    const rows = buildSensorDataRows(data);
+    const savableRows = rows.filter((row) =>
+        row.temperature !== null
+        || row.humidity !== null
+        || row.gas_value !== null
+        || row.fire_detected
+        || row.warning
+    );
 
-    if (sensorPersistInFlight) {
+    if (savableRows.length === 0) {
         markSensorPersistStatus({
             saved: false,
             skipped: true,
-            reason: 'Previous sensor batch is still being saved',
-            rows: 0,
-            error: null
-        });
-        return latestSensorPersistStatus;
-    }
-
-    if (lastSensorPersistMs && elapsedMs < SENSOR_PERSIST_INTERVAL_MS) {
-        markSensorPersistStatus({
-            saved: false,
-            skipped: true,
-            reason: `Wait ${Math.ceil((SENSOR_PERSIST_INTERVAL_MS - elapsedMs) / 1000)} more seconds`,
+            reason: 'No sensor value or alert to save',
             rows: 0,
             error: null
         });
@@ -286,26 +317,27 @@ async function persistSensorDataIfDue(data) {
 
     sensorPersistInFlight = true;
     try {
-        const rows = buildSensorDataRows(data);
-        const { error } = await supabase.from(SENSOR_DATA_TABLE).insert(rows);
+        const { error } = await supabase.from(SENSOR_DATA_TABLE).insert(savableRows);
 
         if (error) throw error;
 
-        lastSensorPersistMs = Date.now();
+        const savedAt = Date.now();
+        if (updatePeriodicClock) lastSensorPersistMs = savedAt;
+        if (alertKey) lastPersistedAlertKey = alertKey;
         markSensorPersistStatus({
             saved: true,
             skipped: false,
-            reason: null,
-            rows: rows.length,
-            lastSavedAt: new Date(lastSensorPersistMs).toISOString(),
+            reason,
+            rows: savableRows.length,
+            lastSavedAt: new Date(savedAt).toISOString(),
             error: null
         });
-        console.log(`Saved ${rows.length} sensor rows to ${SENSOR_DATA_TABLE}`);
+        console.log(`Saved ${savableRows.length} sensor rows to ${SENSOR_DATA_TABLE} (${reason})`);
     } catch (err) {
         markSensorPersistStatus({
             saved: false,
             skipped: false,
-            reason: null,
+            reason,
             rows: 0,
             error: err.message
         });
@@ -317,6 +349,47 @@ async function persistSensorDataIfDue(data) {
     return latestSensorPersistStatus;
 }
 
+function persistSensorDataIfDue(data) {
+    const now = Date.now();
+    const elapsedMs = now - lastSensorPersistMs;
+
+    if (lastSensorPersistMs && elapsedMs < SENSOR_PERSIST_INTERVAL_MS) {
+        markSensorPersistStatus({
+            saved: false,
+            skipped: true,
+            reason: `Wait ${Math.ceil((SENSOR_PERSIST_INTERVAL_MS - elapsedMs) / 1000)} more seconds`,
+            rows: 0,
+            error: null
+        });
+        return Promise.resolve(latestSensorPersistStatus);
+    }
+
+    lastSensorPersistMs = now;
+    return enqueueSensorPersist(data, {
+        reason: 'Periodic sensor snapshot',
+        updatePeriodicClock: true
+    });
+}
+
+function persistSensorAlertIfFirst(alert, data) {
+    const alertKey = sensorAlertPersistKey(alert, data);
+
+    if (!alertKey || alertKey === lastPersistedAlertKey) {
+        return persistSensorDataIfDue(data);
+    }
+
+    lastPersistedAlertKey = alertKey;
+    lastSensorPersistMs = Date.now();
+    return enqueueSensorPersist(data, {
+        reason: 'Immediate first alert snapshot',
+        updatePeriodicClock: true,
+        alertKey
+    }).then((status) => {
+        if (status.error && lastPersistedAlertKey === alertKey) lastPersistedAlertKey = '';
+        return status;
+    });
+}
+
 function rememberAlert(alert) {
     if (!alert) return;
     latestAlert = alert;
@@ -326,8 +399,9 @@ function rememberAlert(alert) {
 }
 
 function clearLatestAlertIfNormal(data) {
-    if (isInactiveAlertValue(data.alert)) {
+    if (!isActiveAlertValue(data.alert)) {
         latestAlert = null;
+        lastPersistedAlertKey = '';
     }
 }
 
@@ -363,6 +437,206 @@ function applyDateFilters(query, timeColumn, start, end) {
     if (start) nextQuery = nextQuery.gte(timeColumn, start);
     if (end) nextQuery = nextQuery.lte(timeColumn, end);
     return nextQuery;
+}
+
+function startOfLocalDay(date = new Date()) {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function addDays(date, days) {
+    const nextDate = new Date(date);
+    nextDate.setDate(nextDate.getDate() + days);
+    return nextDate;
+}
+
+function dateKey(dateLike) {
+    const date = new Date(dateLike);
+    if (Number.isNaN(date.getTime())) return '';
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function timeLabel(dateLike) {
+    const date = new Date(dateLike);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleTimeString('vi-VN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+}
+
+function dayLabel(key) {
+    const [year, month, day] = String(key).split('-').map(Number);
+    if (!year || !month || !day) return String(key || '--');
+    return new Date(year, month - 1, day).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' });
+}
+
+function getStatsRange(rangeValue) {
+    const range = String(rangeValue || 'today').toLowerCase();
+    const now = new Date();
+    const todayStart = startOfLocalDay(now);
+
+    if (range === '7d' || range === '7days') {
+        return { key: '7d', days: 7, start: addDays(todayStart, -6), end: now };
+    }
+    if (range === '30d' || range === '30days') {
+        return { key: '30d', days: 30, start: addDays(todayStart, -29), end: now };
+    }
+    return { key: 'today', days: 1, start: todayStart, end: now };
+}
+
+function buildDayBuckets(days, end = new Date()) {
+    const buckets = [];
+    const start = addDays(startOfLocalDay(end), -(days - 1));
+    for (let index = 0; index < days; index += 1) {
+        const date = addDays(start, index);
+        const key = dateKey(date);
+        buckets.push({ key, label: dayLabel(key), count: 0 });
+    }
+    return buckets;
+}
+
+function average(values) {
+    const numbers = values.filter((value) => Number.isFinite(value));
+    if (numbers.length === 0) return null;
+    return numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
+}
+
+function rowNumber(row, keys) {
+    for (const key of keys) {
+        const number = toNumber(row?.[key]);
+        if (number !== null) return number;
+    }
+    return null;
+}
+
+function appendCurrentSensorRows(rows, range) {
+    if (range.key !== 'today' || !latestSensorData.updatedAt) return rows;
+
+    const updatedAt = new Date(latestSensorData.updatedAt);
+    if (Number.isNaN(updatedAt.getTime()) || updatedAt < range.start || updatedAt > range.end) return rows;
+
+    const activeAlert = isActiveAlertValue(latestSensorData.alert) ? latestSensorData.alert : null;
+    const currentRows = [
+        latestSensorData.temperature !== null ? { created_at: latestSensorData.updatedAt, sensor_name: 'temperature', temperature: latestSensorData.temperature, fire_detected: isTruthy(latestSensorData.fire), warning: activeAlert } : null,
+        latestSensorData.humidity !== null ? { created_at: latestSensorData.updatedAt, sensor_name: 'humidity', humidity: latestSensorData.humidity, fire_detected: isTruthy(latestSensorData.fire), warning: activeAlert } : null,
+        latestSensorData.gas !== null ? { created_at: latestSensorData.updatedAt, sensor_name: 'gas', gas_value: latestSensorData.gas, fire_detected: isTruthy(latestSensorData.fire), warning: activeAlert } : null
+    ].filter(Boolean);
+
+    return rows.concat(currentRows);
+}
+
+function aggregateSensorStats(rows, range) {
+    const pointsByKey = new Map();
+    const tempValues = [];
+    const humiValues = [];
+    const gasValues = [];
+    const alertKeys = new Set();
+
+    for (const row of rows) {
+        const rowTime = firstDefined(row.created_at, row.timestamp);
+        const date = new Date(rowTime);
+        if (Number.isNaN(date.getTime())) continue;
+
+        const temp = rowNumber(row, ['temperature', 'temp']);
+        const humi = rowNumber(row, ['humidity', 'humi', 'hum']);
+        const gas = rowNumber(row, ['gas_value', 'gas']);
+        const hasMetric = temp !== null || humi !== null || gas !== null;
+        const hasAlert = !!(row.fire_detected || row.warning);
+
+        if (!hasMetric && !hasAlert) continue;
+
+        const minuteKey = date.toISOString().slice(0, 16);
+        const groupKey = range.key === 'today' ? minuteKey : dateKey(date);
+        if (!pointsByKey.has(groupKey)) {
+            pointsByKey.set(groupKey, {
+                key: groupKey,
+                label: range.key === 'today' ? timeLabel(date) : dayLabel(dateKey(date)),
+                time: date.toISOString(),
+                temp: [],
+                humi: [],
+                gas: [],
+                hasAlert: false
+            });
+        }
+
+        const point = pointsByKey.get(groupKey);
+
+        if (temp !== null) {
+            point.temp.push(temp);
+            tempValues.push(temp);
+        }
+        if (humi !== null) {
+            point.humi.push(humi);
+            humiValues.push(humi);
+        }
+        if (gas !== null) {
+            point.gas.push(gas);
+            gasValues.push(gas);
+        }
+
+        if (hasAlert) {
+            point.hasAlert = true;
+            alertKeys.add(groupKey);
+        }
+    }
+
+    let points = Array.from(pointsByKey.values())
+        .sort((a, b) => new Date(a.time) - new Date(b.time))
+        .map((point) => ({
+            label: point.label,
+            time: point.time,
+            temperature: average(point.temp),
+            humidity: average(point.humi),
+            gas: average(point.gas),
+            alert: point.hasAlert
+        }));
+
+    if (range.key !== 'today') {
+        const existing = new Map(points.map((point) => [dateKey(point.time), point]));
+        const buckets = buildDayBuckets(range.days, range.end);
+        points = buckets.map((bucket, index) => existing.get(bucket.key) || {
+            label: bucket.label,
+            time: addDays(range.start, index).toISOString(),
+            temperature: null,
+            humidity: null,
+            gas: null,
+            alert: false
+        });
+    }
+
+    return {
+        points,
+        summary: {
+            avgTemperature: average(tempValues),
+            avgHumidity: average(humiValues),
+            avgGas: average(gasValues),
+            alertCount: alertKeys.size,
+            sampleCount: points.length
+        }
+    };
+}
+
+function aggregateStrokeStats(rows, range) {
+    const buckets = buildDayBuckets(range.days, range.end);
+    const bucketMap = new Map(buckets.map((bucket) => [bucket.key, bucket]));
+
+    for (const row of rows) {
+        const key = dateKey(firstDefined(row.timestamp, row.created_at));
+        const bucket = bucketMap.get(key);
+        if (bucket) bucket.count += 1;
+    }
+
+    const maxDay = buckets.reduce((best, item) => item.count > best.count ? item : best, buckets[0] || { label: '--', count: 0 });
+    const total = buckets.reduce((sum, item) => sum + item.count, 0);
+
+    return {
+        days: buckets,
+        summary: {
+            total,
+            maxDay,
+            averagePerDay: buckets.length ? total / buckets.length : 0
+        }
+    };
 }
 
 function getStrokeImageUrl(row = {}) {
@@ -460,26 +734,28 @@ mqttClient.on('connect', () => {
 
 mqttClient.on('message', (topic, message) => {
     const text = message.toString();
+    const receivedAt = vietnamTimestamp();
 
     if (topic === SENSOR_DATA_TOPIC) {
         try {
             const payload = JSON.parse(text);
             const normalizedData = normalizeSensorPayload(payload);
+            normalizedData.receivedAt = receivedAt;
             latestSensorData = {
                 ...latestSensorData,
                 ...normalizedData,
                 topic,
-                updatedAt: new Date().toISOString()
+                updatedAt: receivedAt
             };
 
             const alert = buildAlertFromPayload(topic, normalizedData, payload);
             if (alert) {
                 rememberAlert(alert);
+                persistSensorAlertIfFirst(alert, normalizedData);
             } else {
                 clearLatestAlertIfNormal(normalizedData);
+                persistSensorDataIfDue(normalizedData);
             }
-
-            persistSensorDataIfDue(normalizedData);
         } catch (err) {
             console.error('Invalid sensor payload:', err.message);
         }
@@ -490,9 +766,11 @@ mqttClient.on('message', (topic, message) => {
         try {
             const payload = JSON.parse(text);
             const normalizedData = normalizeSensorPayload(payload);
+            normalizedData.receivedAt = receivedAt;
             const alert = buildAlertFromPayload(topic, normalizedData, payload);
             if (alert) {
                 rememberAlert(alert);
+                persistSensorAlertIfFirst(alert, normalizedData);
             } else {
                 clearLatestAlertIfNormal(normalizedData);
             }
@@ -579,6 +857,130 @@ app.get('/api/sensors/history', async (req, res) => {
     }
 });
 
+app.get('/api/history', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const type = String(req.query.type || 'sensor').toLowerCase();
+    const range = getStatsRange(req.query.range);
+    const start = range.start.toISOString();
+    const end = range.end.toISOString();
+    const sensorStart = vietnamRangeTimestamp(range.start);
+    const sensorEnd = vietnamRangeTimestamp(range.end);
+    const limit = Math.min(Math.max(Number(req.query.limit || 300), 1), 1000);
+
+    try {
+        if (type === 'images' || type === 'stroke_event' || type === 'stroke_events') {
+            const { data, error } = await supabase
+                .from(STROKE_EVENTS_TABLE)
+                .select('*')
+                .gte('timestamp', start)
+                .lte('timestamp', end)
+                .order('timestamp', { ascending: false, nullsFirst: false })
+                .order('id', { ascending: false })
+                .limit(limit);
+
+            if (error) throw error;
+
+            return res.json({
+                type: 'images',
+                range: range.key,
+                start,
+                end,
+                rows: data || [],
+                count: data?.length || 0
+            });
+        }
+
+        const { data, error } = await supabase
+            .from(SENSOR_DATA_TABLE)
+            .select('*')
+            .gte('created_at', sensorStart)
+            .lte('created_at', sensorEnd)
+            .order('created_at', { ascending: false, nullsFirst: false })
+            .order('id', { ascending: false })
+            .limit(limit);
+
+        if (error) throw error;
+
+        const rows = (data || []).filter((row) => row.fire_detected || (row.warning && String(row.warning).trim()));
+        return res.json({
+            type: 'sensor',
+            range: range.key,
+            start,
+            end,
+            rows,
+            count: rows.length
+        });
+    } catch (err) {
+        console.error('History Query Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/statistics', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    if (!supabase) {
+        return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
+    }
+
+    const type = String(req.query.type || 'sensor').toLowerCase();
+    const range = getStatsRange(req.query.range);
+    const start = range.start.toISOString();
+    const end = range.end.toISOString();
+    const sensorStart = vietnamRangeTimestamp(range.start);
+    const sensorEnd = vietnamRangeTimestamp(range.end);
+
+    try {
+        if (type === 'stroke_event' || type === 'stroke_events' || type === 'stroke') {
+            const { data, error } = await supabase
+                .from(STROKE_EVENTS_TABLE)
+                .select('*')
+                .gte('timestamp', start)
+                .lte('timestamp', end)
+                .order('timestamp', { ascending: true, nullsFirst: false })
+                .limit(5000);
+
+            if (error) throw error;
+
+            return res.json({
+                type: 'stroke_event',
+                range: range.key,
+                start,
+                end,
+                ...aggregateStrokeStats(data || [], range)
+            });
+        }
+
+        const { data, error } = await supabase
+            .from(SENSOR_DATA_TABLE)
+            .select('*')
+            .gte('created_at', sensorStart)
+            .lte('created_at', sensorEnd)
+            .order('created_at', { ascending: true, nullsFirst: false })
+            .order('id', { ascending: true })
+            .limit(5000);
+
+        if (error) throw error;
+
+        const rows = appendCurrentSensorRows(data || [], range);
+        return res.json({
+            type: 'sensor',
+            range: range.key,
+            start,
+            end,
+            ...aggregateSensorStats(rows, range)
+        });
+    } catch (err) {
+        console.error('Statistics Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/database/:table', async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
@@ -629,8 +1031,8 @@ app.delete('/api/database/:table/:id', async (req, res) => {
         return res.status(400).json({ error: 'Bang du lieu khong duoc ho tro' });
     }
 
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
         return res.status(400).json({ error: 'ID khong hop le' });
     }
 
@@ -644,8 +1046,20 @@ app.delete('/api/database/:table/:id', async (req, res) => {
                 .eq('id', id)
                 .single();
 
-            if (fetchError) throw fetchError;
-            storageResult = await deleteStrokeEventImage(row);
+            if (fetchError) {
+                storageResult = { deleted: false, path: null, reason: fetchError.message };
+            } else {
+                try {
+                    storageResult = await deleteStrokeEventImage(row);
+                } catch (storageError) {
+                    storageResult = {
+                        deleted: false,
+                        path: getStoragePathFromUrl(getStrokeImageUrl(row)),
+                        reason: storageError.message
+                    };
+                    console.warn('Storage delete failed, deleting database row anyway:', storageError.message);
+                }
+            }
         }
 
         const { data, error } = await supabase
