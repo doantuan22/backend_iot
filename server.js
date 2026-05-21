@@ -25,7 +25,15 @@ if (!supabase) {
     console.warn('WARNING: SUPABASE_SERVICE_ROLE_KEY is not set. Inserts/deletes can fail when Supabase RLS is enabled.');
 }
 
-const SENSOR_TOPIC_FILTER = process.env.MQTT_SENSOR_TOPIC || 'wokwi/sensors/#';
+function normalizeMqttTopicFilter(value, fallback) {
+    const topic = String(value || fallback || '').trim();
+    if (!topic) return fallback;
+    if (topic.includes('#') || topic.includes('+')) return topic;
+    if (topic.endsWith('/')) return `${topic}#`;
+    return topic;
+}
+
+const SENSOR_TOPIC_FILTER = normalizeMqttTopicFilter(process.env.MQTT_SENSOR_TOPIC, 'wokwi/sensors/#');
 const SENSOR_DATA_TOPIC = process.env.MQTT_SENSOR_DATA_TOPIC || 'wokwi/sensors/data';
 const COMMAND_TOPIC = process.env.MQTT_COMMAND_TOPIC || 'wokwi/sensors/commands';
 const SENSOR_DATA_TABLE = process.env.SENSOR_DATA_TABLE || 'sensor_data';
