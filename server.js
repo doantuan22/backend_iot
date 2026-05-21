@@ -41,11 +41,21 @@ const DATABASE_TABLES = {
 const mqttOptions = {
     host: process.env.MQTT_BROKER || 'broker.hivemq.com',
     port: Number(process.env.MQTT_PORT || 8883),
-    protocol: (process.env.MQTT_BROKER && process.env.MQTT_BROKER.includes('hivemq.cloud')) ? 'mqtts' : 'mqtt',
+    protocol: process.env.MQTT_PROTOCOL || ((process.env.MQTT_BROKER && process.env.MQTT_BROKER.includes('hivemq.cloud')) ? 'mqtts' : 'mqtt'),
     username: process.env.MQTT_USERNAME,
     password: process.env.MQTT_PASSWORD,
     clientId: process.env.MQTT_CLIENT_ID || ('backend_' + Math.random().toString(16).slice(2, 10)),
     rejectUnauthorized: false
+};
+
+const mqttRuntimeConfig = {
+    host: mqttOptions.host,
+    port: mqttOptions.port,
+    protocol: mqttOptions.protocol,
+    usernameConfigured: !!mqttOptions.username,
+    sensorTopicFilter: SENSOR_TOPIC_FILTER,
+    sensorDataTopic: SENSOR_DATA_TOPIC,
+    commandTopic: COMMAND_TOPIC
 };
 
 const mqttClient = mqtt.connect(mqttOptions);
@@ -194,6 +204,42 @@ function buildAlertFromPayload(topic, data, rawData) {
         raw: rawData,
         updatedAt: new Date().toISOString()
     };
+}
+
+function hasSensorContent(data) {
+    const thresholds = data.thresholds || {};
+    return data.temperature !== null
+        || data.humidity !== null
+        || data.gas !== null
+        || hasAlertValue(data.fire)
+        || hasAlertValue(data.alert)
+        || thresholds.temperature !== null
+        || thresholds.humidity !== null
+        || thresholds.gas !== null;
+}
+
+function handleSensorPayload(topic, payload, receivedAt) {
+    const normalizedData = normalizeSensorPayload(payload);
+    if (!hasSensorContent(normalizedData)) return false;
+
+    normalizedData.receivedAt = receivedAt;
+    latestSensorData = {
+        ...latestSensorData,
+        ...normalizedData,
+        topic,
+        updatedAt: receivedAt
+    };
+
+    const alert = buildAlertFromPayload(topic, normalizedData, payload);
+    if (alert) {
+        rememberAlert(alert);
+        persistSensorAlertIfFirst(alert, normalizedData);
+    } else {
+        clearLatestAlertIfNormal(normalizedData);
+        persistSensorDataIfDue(normalizedData);
+    }
+
+    return true;
 }
 
 function buildWarningForSensor(sensorName, data) {
@@ -740,35 +786,22 @@ mqttClient.on('message', (topic, message) => {
     const text = message.toString();
     const receivedAt = vietnamTimestamp();
 
-    if (topic === SENSOR_DATA_TOPIC) {
-        try {
-            const payload = JSON.parse(text);
-            const normalizedData = normalizeSensorPayload(payload);
-            normalizedData.receivedAt = receivedAt;
-            latestSensorData = {
-                ...latestSensorData,
-                ...normalizedData,
-                topic,
-                updatedAt: receivedAt
-            };
-
-            const alert = buildAlertFromPayload(topic, normalizedData, payload);
-            if (alert) {
-                rememberAlert(alert);
-                persistSensorAlertIfFirst(alert, normalizedData);
-            } else {
-                clearLatestAlertIfNormal(normalizedData);
-                persistSensorDataIfDue(normalizedData);
-            }
-        } catch (err) {
+    let payload = null;
+    try {
+        payload = JSON.parse(text);
+    } catch (err) {
+        if (topic === SENSOR_DATA_TOPIC) {
             console.error('Invalid sensor payload:', err.message);
+            return;
         }
+    }
+
+    if (payload && handleSensorPayload(topic, payload, receivedAt)) {
         return;
     }
 
     if (topic.includes('alert')) {
         try {
-            const payload = JSON.parse(text);
             const normalizedData = normalizeSensorPayload(payload);
             normalizedData.receivedAt = receivedAt;
             const alert = buildAlertFromPayload(topic, normalizedData, payload);
@@ -1151,6 +1184,7 @@ app.get('/api/health', async (req, res) => {
     res.json({
         status: 'online',
         mqtt: mqttClient.connected,
+        mqttConfig: mqttRuntimeConfig,
         supabase: supabaseStatus.connected,
         supabaseStatus,
         latestSensorData,
