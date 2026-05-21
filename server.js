@@ -33,9 +33,15 @@ function normalizeMqttTopicFilter(value, fallback) {
     return topic;
 }
 
+function normalizeMqttPublishTopic(value, fallback) {
+    const topic = String(value || fallback || '').trim();
+    if (!topic || topic.includes('#') || topic.includes('+')) return fallback;
+    return topic;
+}
+
 const SENSOR_TOPIC_FILTER = normalizeMqttTopicFilter(process.env.MQTT_SENSOR_TOPIC, 'wokwi/sensors/#');
 const SENSOR_DATA_TOPIC = process.env.MQTT_SENSOR_DATA_TOPIC || 'wokwi/sensors/data';
-const COMMAND_TOPIC = process.env.MQTT_COMMAND_TOPIC || 'wokwi/sensors/commands';
+const COMMAND_TOPIC = normalizeMqttPublishTopic(process.env.MQTT_COMMAND_TOPIC, 'wokwi/sensors/commands');
 const SENSOR_DATA_TABLE = process.env.SENSOR_DATA_TABLE || 'sensor_data';
 const SENSOR_PERSIST_INTERVAL_MS = Number(process.env.SENSOR_PERSIST_INTERVAL_MS || 5 * 60 * 1000);
 const STROKE_EVENTS_TABLE = process.env.STROKE_EVENTS_TABLE || 'stroke_events';
@@ -53,7 +59,12 @@ const mqttOptions = {
     username: process.env.MQTT_USERNAME,
     password: process.env.MQTT_PASSWORD,
     clientId: process.env.MQTT_CLIENT_ID || ('backend_' + Math.random().toString(16).slice(2, 10)),
-    rejectUnauthorized: false
+    rejectUnauthorized: false,
+    keepalive: 60,
+    reconnectPeriod: 3000,
+    connectTimeout: 30000,
+    clean: true,
+    resubscribe: true
 };
 
 const mqttRuntimeConfig = {
@@ -833,6 +844,18 @@ mqttClient.on('message', (topic, message) => {
 
 mqttClient.on('error', (err) => {
     console.error('MQTT Error:', err.message);
+});
+
+mqttClient.on('reconnect', () => {
+    console.warn('MQTT reconnecting...');
+});
+
+mqttClient.on('close', () => {
+    console.warn('MQTT connection closed');
+});
+
+mqttClient.on('offline', () => {
+    console.warn('MQTT client offline');
 });
 
 app.get('/api/images', async (req, res) => {
