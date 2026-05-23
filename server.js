@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const mqtt = require('mqtt');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
@@ -13,6 +14,20 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
+const AUTH_SECRET = process.env.AUTH_SECRET || 'iot-demo-auth-secret';
+const AUTH_TOKEN_TTL_MS = Number(process.env.AUTH_TOKEN_TTL_MS || 8 * 60 * 60 * 1000);
+const authUsers = {
+    admin: {
+        username: process.env.ADMIN_USERNAME || 'admin',
+        password: process.env.ADMIN_PASSWORD || 'admin123',
+        role: 'admin'
+    },
+    user: {
+        username: process.env.USER_USERNAME || 'user',
+        password: process.env.USER_PASSWORD || 'user123',
+        role: 'user'
+    }
+};
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
@@ -44,6 +59,7 @@ const SENSOR_DATA_TOPIC = process.env.MQTT_SENSOR_DATA_TOPIC || 'wokwi/sensors/d
 const COMMAND_TOPIC = normalizeMqttPublishTopic(process.env.MQTT_COMMAND_TOPIC, 'wokwi/sensors/commands');
 const SENSOR_DATA_TABLE = process.env.SENSOR_DATA_TABLE || 'sensor_data';
 const SENSOR_PERSIST_INTERVAL_MS = Number(process.env.SENSOR_PERSIST_INTERVAL_MS || 5 * 60 * 1000);
+const SUPABASE_HEALTH_TIMEOUT_MS = Number(process.env.SUPABASE_HEALTH_TIMEOUT_MS || 3000);
 const STROKE_EVENTS_TABLE = process.env.STROKE_EVENTS_TABLE || 'stroke_events';
 const SURVEILLANCE_BUCKET = process.env.SURVEILLANCE_BUCKET || 'surveillance-images';
 const DATABASE_TABLES = {
@@ -78,6 +94,73 @@ const mqttRuntimeConfig = {
 };
 
 const mqttClient = mqtt.connect(mqttOptions);
+
+function base64urlEncode(value) {
+    return Buffer.from(value).toString('base64url');
+}
+
+function base64urlJson(value) {
+    return base64urlEncode(JSON.stringify(value));
+}
+
+function signTokenPayload(payloadPart) {
+    return crypto.createHmac('sha256', AUTH_SECRET).update(payloadPart).digest('base64url');
+}
+
+function createAuthToken(user) {
+    const payload = {
+        username: user.username,
+        role: user.role,
+        exp: Date.now() + AUTH_TOKEN_TTL_MS
+    };
+    const payloadPart = base64urlJson(payload);
+    return `${payloadPart}.${signTokenPayload(payloadPart)}`;
+}
+
+function verifyAuthToken(token) {
+    const [payloadPart, signature] = String(token || '').split('.');
+    if (!payloadPart || !signature) return null;
+
+    const expectedSignature = signTokenPayload(payloadPart);
+    const signatureBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+    if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
+        return null;
+    }
+
+    try {
+        const payload = JSON.parse(Buffer.from(payloadPart, 'base64url').toString('utf8'));
+        if (!payload.exp || Date.now() > payload.exp) return null;
+        if (!['admin', 'user'].includes(payload.role)) return null;
+        return { username: payload.username, role: payload.role };
+    } catch (err) {
+        return null;
+    }
+}
+
+function getAuthUser(req) {
+    const header = req.get('Authorization') || '';
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match ? verifyAuthToken(match[1]) : null;
+}
+
+function requireAuth(req, res, next) {
+    const user = getAuthUser(req);
+    if (!user) {
+        return res.status(401).json({ error: 'Cần đăng nhập để tiếp tục' });
+    }
+    req.authUser = user;
+    next();
+}
+
+function requireAdmin(req, res, next) {
+    requireAuth(req, res, () => {
+        if (req.authUser.role !== 'admin') {
+            return res.status(403).json({ error: 'Tài khoản user không có quyền truy cập database' });
+        }
+        next();
+    });
+}
 
 let latestSensorData = {
     temperature: null,
@@ -767,9 +850,13 @@ async function checkSupabaseStatus(force = false) {
 
     lastSupabaseCheckMs = now;
     try {
-        const { error } = await supabase
+        const healthQuery = supabase
             .from(SENSOR_DATA_TABLE)
             .select('*', { count: 'exact', head: true });
+        const timeout = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Supabase health timeout after ${SUPABASE_HEALTH_TIMEOUT_MS}ms`)), SUPABASE_HEALTH_TIMEOUT_MS);
+        });
+        const { error } = await Promise.race([healthQuery, timeout]);
 
         if (error) throw error;
 
@@ -856,6 +943,30 @@ mqttClient.on('close', () => {
 
 mqttClient.on('offline', () => {
     console.warn('MQTT client offline');
+});
+
+app.post('/api/auth/login', (req, res) => {
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password || '');
+    const user = Object.values(authUsers).find((candidate) =>
+        candidate.username === username && candidate.password === password
+    );
+
+    if (!user) {
+        return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
+    }
+
+    res.json({
+        token: createAuthToken(user),
+        user: {
+            username: user.username,
+            role: user.role
+        }
+    });
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+    res.json({ user: req.authUser });
 });
 
 app.get('/api/images', async (req, res) => {
@@ -1049,7 +1160,7 @@ app.get('/api/statistics', async (req, res) => {
     }
 });
 
-app.get('/api/database/:table', async (req, res) => {
+app.get('/api/database/:table', requireAdmin, async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
     if (!supabase) {
@@ -1089,7 +1200,7 @@ app.get('/api/database/:table', async (req, res) => {
     }
 });
 
-app.delete('/api/database/:table/:id', async (req, res) => {
+app.delete('/api/database/:table/:id', requireAdmin, async (req, res) => {
     if (!supabase) {
         return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
     }
@@ -1148,7 +1259,7 @@ app.delete('/api/database/:table/:id', async (req, res) => {
     }
 });
 
-app.delete('/api/database/sensor_data', async (req, res) => {
+app.delete('/api/database/sensor_data', requireAdmin, async (req, res) => {
     if (!supabase) {
         return res.status(500).json({ error: 'Supabase chua duoc cau hinh' });
     }
