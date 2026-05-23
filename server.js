@@ -266,6 +266,46 @@ function vietnamRangeTimestamp(date) {
     return vietnamTimestamp(date);
 }
 
+function parseVietnamTimestamp(value) {
+    if (value instanceof Date) return value.getTime();
+    if (value === undefined || value === null || value === '') return NaN;
+    if (typeof value === 'number') return value < 10000000000 ? value * 1000 : value;
+
+    const raw = String(value).trim();
+    if (!raw) return NaN;
+    if (/^\d+$/.test(raw)) {
+        const number = Number(raw);
+        return number < 10000000000 ? number * 1000 : number;
+    }
+
+    const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized);
+    const vietnamTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(normalized) && !hasTimezone
+        ? `${normalized}+07:00`
+        : raw;
+
+    return Date.parse(vietnamTime);
+}
+
+function strokeEventSortTime(row = {}) {
+    const time = parseVietnamTimestamp(firstDefined(row.timestamp, row.created_at, row.createdAt));
+    return Number.isFinite(time) ? time : 0;
+}
+
+function strokeEventSortId(row = {}) {
+    const id = Number(row.id);
+    return Number.isFinite(id) ? id : 0;
+}
+
+function dedupeStrokeEvents(rows = []) {
+    const map = new Map();
+    for (const row of rows) {
+        const key = String(firstDefined(row.id, getStrokeImageUrl(row), JSON.stringify(row)));
+        map.set(key, row);
+    }
+    return [...map.values()];
+}
+
 function addIssue(issues, type, message) {
     issues.push({ type, message });
 }
@@ -977,14 +1017,32 @@ app.get('/api/images', async (req, res) => {
     }
 
     try {
-        const { data, error } = await supabase
+        const timestampResult = await supabase
             .from(STROKE_EVENTS_TABLE)
             .select('*')
             .order('timestamp', { ascending: false, nullsFirst: false })
             .order('id', { ascending: false })
             .limit(11);
 
-        if (error) throw error;
+        if (timestampResult.error) throw timestampResult.error;
+
+        const createdAtResult = await supabase
+            .from(STROKE_EVENTS_TABLE)
+            .select('*')
+            .order('created_at', { ascending: false, nullsFirst: false })
+            .order('id', { ascending: false })
+            .limit(11);
+
+        if (createdAtResult.error) {
+            console.warn('Stroke events created_at fallback skipped:', createdAtResult.error.message);
+        }
+
+        const data = dedupeStrokeEvents([
+            ...(timestampResult.data || []),
+            ...(!createdAtResult.error ? (createdAtResult.data || []) : [])
+        ])
+            .sort((a, b) => strokeEventSortTime(b) - strokeEventSortTime(a) || strokeEventSortId(b) - strokeEventSortId(a))
+            .slice(0, 11);
 
         latestSupabaseStatus = {
             connected: true,
