@@ -61,12 +61,58 @@ const SENSOR_DATA_TABLE = process.env.SENSOR_DATA_TABLE || 'sensor_data';
 const SENSOR_PERSIST_INTERVAL_MS = Number(process.env.SENSOR_PERSIST_INTERVAL_MS || 5 * 60 * 1000);
 const SUPABASE_HEALTH_TIMEOUT_MS = Number(process.env.SUPABASE_HEALTH_TIMEOUT_MS || 3000);
 const STROKE_EVENTS_TABLE = process.env.STROKE_EVENTS_TABLE || 'stroke_events';
+const AIRPORT_EVENTS_TABLE = process.env.AIRPORT_EVENTS_TABLE || 'airport_events';
+const BAGGAGE_TRACKS_TABLE = process.env.BAGGAGE_TRACKS_TABLE || 'baggage_tracks';
 const SURVEILLANCE_BUCKET = process.env.SURVEILLANCE_BUCKET || 'surveillance-images';
-const DATABASE_TABLES = {
-    stroke_event: { table: STROKE_EVENTS_TABLE, timeColumn: 'timestamp', storageBucket: SURVEILLANCE_BUCKET },
-    stroke_events: { table: STROKE_EVENTS_TABLE, timeColumn: 'timestamp', storageBucket: SURVEILLANCE_BUCKET },
-    sensor_data: { table: SENSOR_DATA_TABLE, timeColumn: 'created_at' }
-};
+const AI_EVENT_TABLE_CONFIGS = [
+    {
+        key: 'stroke_events',
+        aliases: ['stroke_event', 'stroke_events', 'stroke'],
+        table: STROKE_EVENTS_TABLE,
+        label: 'Stroke_event',
+        timeColumns: ['timestamp', 'created_at'],
+        statsTimeColumns: ['timestamp', 'created_at'],
+        idColumn: 'id',
+        storageBucket: SURVEILLANCE_BUCKET,
+        imageSource: true,
+        statsMode: 'event_rows'
+    },
+    {
+        key: 'airport_events',
+        aliases: ['airport_event', 'airport_events'],
+        table: AIRPORT_EVENTS_TABLE,
+        label: 'airport_events',
+        timeColumns: ['created_at'],
+        statsTimeColumns: ['created_at'],
+        idColumn: 'id',
+        storageBucket: SURVEILLANCE_BUCKET,
+        imageSource: true,
+        statsMode: 'event_rows'
+    },
+    {
+        key: 'baggage_tracks',
+        aliases: ['baggage_track', 'baggage_tracks'],
+        table: BAGGAGE_TRACKS_TABLE,
+        label: 'baggage_tracks',
+        timeColumns: ['updated_at', 'last_seen_at', 'owner_gone_at', 'first_seen_at'],
+        statsTimeColumns: ['owner_gone_at'],
+        idColumn: 'track_id',
+        imageSource: false,
+        statsMode: 'alerted_tracks'
+    }
+].map((config) => ({
+    ...config,
+    timeColumn: config.timeColumns[0],
+    isAiEvent: true
+}));
+const DATABASE_TABLES = AI_EVENT_TABLE_CONFIGS.reduce((tables, config) => {
+    for (const alias of config.aliases) {
+        tables[alias] = config;
+    }
+    return tables;
+}, {
+    sensor_data: { table: SENSOR_DATA_TABLE, label: 'sensor_data', timeColumn: 'created_at', idColumn: 'id' }
+});
 
 const mqttOptions = {
     host: process.env.MQTT_BROKER || 'broker.hivemq.com',
@@ -287,23 +333,92 @@ function parseVietnamTimestamp(value) {
     return Date.parse(vietnamTime);
 }
 
-function strokeEventSortTime(row = {}) {
-    const time = parseVietnamTimestamp(firstDefined(row.timestamp, row.created_at, row.createdAt));
+function getAiEventTime(row = {}, config = null) {
+    const configuredColumns = config?.timeColumns || [];
+    return firstDefined(
+        ...configuredColumns.map((column) => row[column]),
+        row.ai_timestamp,
+        row.timestamp,
+        row.created_at,
+        row.createdAt,
+        row.updated_at,
+        row.updatedAt,
+        row.last_seen_at,
+        row.lastSeenAt,
+        row.owner_gone_at,
+        row.ownerGoneAt,
+        row.first_seen_at,
+        row.firstSeenAt
+    );
+}
+
+function getAiEventId(row = {}, config = null) {
+    return firstDefined(row[config?.idColumn], row.id, row.track_id, row.trackId);
+}
+
+function aiEventSortTime(row = {}) {
+    const time = parseVietnamTimestamp(getAiEventTime(row));
     return Number.isFinite(time) ? time : 0;
 }
 
-function strokeEventSortId(row = {}) {
-    const id = Number(row.id);
+function aiEventSortId(row = {}) {
+    const id = Number(getAiEventId(row));
     return Number.isFinite(id) ? id : 0;
 }
 
-function dedupeStrokeEvents(rows = []) {
+function aiEventDedupeKey(row = {}) {
+    return [
+        row.source_table || row.ai_table || 'ai_event',
+        firstDefined(getAiEventId(row), getAiEventImageUrl(row), JSON.stringify(row))
+    ].join(':');
+}
+
+function dedupeAiEvents(rows = []) {
     const map = new Map();
     for (const row of rows) {
-        const key = String(firstDefined(row.id, getStrokeImageUrl(row), JSON.stringify(row)));
-        map.set(key, row);
+        const key = aiEventDedupeKey(row);
+        if (!map.has(key)) map.set(key, row);
     }
     return [...map.values()];
+}
+
+function normalizeAiEventRow(row = {}, config, timeColumn = '') {
+    const normalized = {
+        ...row,
+        ai_timestamp: firstDefined(row.ai_timestamp, row[timeColumn], getAiEventTime(row, config)),
+        source_key: config.key,
+        source_table: config.table,
+        source_label: config.label,
+        ai_table: config.table
+    };
+    if (normalized.id === undefined || normalized.id === null || normalized.id === '') {
+        normalized.id = getAiEventId(row, config);
+    }
+    return normalized;
+}
+
+function hasAiEventImage(row = {}) {
+    return !!getAiEventImageUrl(row);
+}
+
+function isAiEventStatsRow(row = {}, config = {}) {
+    if (config.statsMode === 'event_rows') return true;
+    if (config.statsMode === 'alerted_tracks') {
+        return row.alerted === true || String(row.alerted).toLowerCase() === 'true';
+    }
+    return hasAiEventImage(row);
+}
+
+function strokeEventSortTime(row = {}) {
+    return aiEventSortTime(row);
+}
+
+function strokeEventSortId(row = {}) {
+    return aiEventSortId(row);
+}
+
+function dedupeStrokeEvents(rows = []) {
+    return dedupeAiEvents(rows);
 }
 
 function addIssue(issues, type, message) {
@@ -631,6 +746,104 @@ function applyDateFilters(query, timeColumn, start, end) {
     return nextQuery;
 }
 
+function aiEventColumnsForQuery(config, options = {}) {
+    const useAllTimeColumns = !!options.useAllTimeColumns;
+    const useStatsTimeColumns = !!options.useStatsTimeColumns;
+    const columns = useStatsTimeColumns
+        ? (config.statsTimeColumns || config.timeColumns)
+        : useAllTimeColumns
+            ? config.timeColumns
+            : [config.timeColumn || config.timeColumns?.[0]];
+    return [...new Set(columns.filter(Boolean))];
+}
+
+async function fetchAiEventRows(config, options = {}) {
+    const {
+        limit = 100,
+        start = '',
+        end = '',
+        ascending = false,
+        requireImage = false,
+        requireStatsAlert = false,
+        useAllTimeColumns = false,
+        useStatsTimeColumns = false
+    } = options;
+    if (requireImage && config.imageSource === false) return [];
+
+    const rows = [];
+    const timeColumns = aiEventColumnsForQuery(config, { useAllTimeColumns, useStatsTimeColumns });
+    let firstError = null;
+    let successCount = 0;
+
+    for (const timeColumn of timeColumns) {
+        try {
+            let query = supabase
+                .from(config.table)
+                .select('*')
+                .order(timeColumn, { ascending, nullsFirst: false })
+                .limit(limit);
+
+            if (config.idColumn && config.idColumn !== timeColumn) {
+                query = query.order(config.idColumn, { ascending });
+            }
+
+            query = applyDateFilters(query, timeColumn, start, end);
+
+            const { data, error } = await query;
+            if (error) throw error;
+
+            successCount += 1;
+            rows.push(...(data || []).map((row) => normalizeAiEventRow(row, config, timeColumn)));
+        } catch (err) {
+            if (!firstError) firstError = err;
+            console.warn(`AI event query skipped for ${config.table}.${timeColumn}:`, err.message);
+        }
+    }
+
+    if (successCount === 0 && firstError) throw firstError;
+
+    return dedupeAiEvents(rows)
+        .filter((row) => !requireImage || hasAiEventImage(row))
+        .filter((row) => !requireStatsAlert || isAiEventStatsRow(row, config));
+}
+
+async function fetchAiEventRowsFromAll(options = {}) {
+    const results = await Promise.all(AI_EVENT_TABLE_CONFIGS.map(async (config) => {
+        try {
+            return { config, rows: await fetchAiEventRows(config, options), error: null };
+        } catch (err) {
+            console.warn(`AI event table skipped for ${config.table}:`, err.message);
+            return { config, rows: [], error: err };
+        }
+    }));
+
+    const hasSuccessfulQuery = results.some((result) => !result.error);
+    const firstError = results.find((result) => result.error)?.error;
+    if (!hasSuccessfulQuery && firstError) throw firstError;
+
+    return results.flatMap((result) => result.rows);
+}
+
+async function fetchAiEventRowsByTable(options = {}) {
+    const results = await Promise.all(AI_EVENT_TABLE_CONFIGS.map(async (config) => {
+        try {
+            return { config, rows: await fetchAiEventRows(config, options), error: null };
+        } catch (err) {
+            console.warn(`AI event table skipped for ${config.table}:`, err.message);
+            return { config, rows: [], error: err };
+        }
+    }));
+
+    const hasSuccessfulQuery = results.some((result) => !result.error);
+    const firstError = results.find((result) => result.error)?.error;
+    if (!hasSuccessfulQuery && firstError) throw firstError;
+
+    return results.reduce((grouped, result) => {
+        grouped[result.config.key] = result.rows;
+        return grouped;
+    }, {});
+}
+
 function startOfLocalDay(date = new Date()) {
     return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
@@ -813,7 +1026,7 @@ function aggregateStrokeStats(rows, range) {
     const bucketMap = new Map(buckets.map((bucket) => [bucket.key, bucket]));
 
     for (const row of rows) {
-        const key = dateKey(firstDefined(row.timestamp, row.created_at));
+        const key = dateKey(getAiEventTime(row));
         const bucket = bucketMap.get(key);
         if (bucket) bucket.count += 1;
     }
@@ -831,11 +1044,89 @@ function aggregateStrokeStats(rows, range) {
     };
 }
 
-function getStrokeImageUrl(row = {}) {
-    return firstDefined(row.image_url, row.imageUrl, row.url, row.image, row.path, row.file_path, row.filePath);
+function aggregateAiEventStats(rowsByTable, range) {
+    const allRows = [];
+    const tables = AI_EVENT_TABLE_CONFIGS.map((config) => {
+        const rows = rowsByTable[config.key] || [];
+        allRows.push(...rows);
+        return {
+            key: config.key,
+            table: config.table,
+            label: config.label,
+            count: rows.length
+        };
+    });
+    const dailyStats = aggregateStrokeStats(allRows, range);
+    const maxTable = tables.reduce(
+        (best, item) => item.count > best.count ? item : best,
+        tables[0] || { label: '--', count: 0 }
+    );
+
+    return {
+        ...dailyStats,
+        tables,
+        summary: {
+            ...dailyStats.summary,
+            total: tables.reduce((sum, item) => sum + item.count, 0),
+            maxTable,
+            tableCount: tables.length
+        }
+    };
 }
 
-function getStoragePathFromUrl(value) {
+function objectFromJson(value) {
+    if (!value) return null;
+    if (typeof value === 'object') return value;
+    if (typeof value !== 'string') return null;
+
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (err) {
+        return null;
+    }
+}
+
+function getAiEventImageUrl(row = {}) {
+    const metadata = objectFromJson(row.metadata);
+    const bbox = objectFromJson(row.bbox);
+    return firstDefined(
+        row.image_url,
+        row.imageUrl,
+        row.imageURL,
+        row.snapshot_url,
+        row.snapshotUrl,
+        row.frame_url,
+        row.frameUrl,
+        row.photo_url,
+        row.photoUrl,
+        row.thumbnail_url,
+        row.thumbnailUrl,
+        row.url,
+        row.image,
+        row.path,
+        row.file_path,
+        row.filePath,
+        metadata?.image_url,
+        metadata?.imageUrl,
+        metadata?.snapshot_url,
+        metadata?.snapshotUrl,
+        metadata?.frame_url,
+        metadata?.frameUrl,
+        metadata?.url,
+        metadata?.path,
+        bbox?.image_url,
+        bbox?.imageUrl,
+        bbox?.url,
+        bbox?.path
+    );
+}
+
+function getStrokeImageUrl(row = {}) {
+    return getAiEventImageUrl(row);
+}
+
+function getStoragePathFromUrl(value, bucket = SURVEILLANCE_BUCKET) {
     if (!value) return null;
 
     const text = String(value).trim();
@@ -848,8 +1139,8 @@ function getStoragePathFromUrl(value) {
     try {
         const url = new URL(text);
         const decodedPath = decodeURIComponent(url.pathname);
-        const publicMarker = `/storage/v1/object/public/${SURVEILLANCE_BUCKET}/`;
-        const signedMarker = `/storage/v1/object/sign/${SURVEILLANCE_BUCKET}/`;
+        const publicMarker = `/storage/v1/object/public/${bucket}/`;
+        const signedMarker = `/storage/v1/object/sign/${bucket}/`;
         const marker = decodedPath.includes(publicMarker) ? publicMarker : signedMarker;
         const index = decodedPath.indexOf(marker);
 
@@ -860,17 +1151,22 @@ function getStoragePathFromUrl(value) {
     }
 }
 
-async function deleteStrokeEventImage(row) {
-    const imagePath = getStoragePathFromUrl(getStrokeImageUrl(row));
+async function deleteAiEventImage(row, config = {}) {
+    const bucket = config.storageBucket || SURVEILLANCE_BUCKET;
+    const imagePath = getStoragePathFromUrl(getAiEventImageUrl(row), bucket);
 
     if (!imagePath) {
         return { deleted: false, path: null, reason: 'No storage path found on row' };
     }
 
-    const { error } = await supabase.storage.from(SURVEILLANCE_BUCKET).remove([imagePath]);
+    const { error } = await supabase.storage.from(bucket).remove([imagePath]);
     if (error) throw error;
 
     return { deleted: true, path: imagePath, reason: null };
+}
+
+async function deleteStrokeEventImage(row) {
+    return deleteAiEventImage(row, { storageBucket: SURVEILLANCE_BUCKET });
 }
 
 async function checkSupabaseStatus(force = false) {
@@ -1017,31 +1313,12 @@ app.get('/api/images', async (req, res) => {
     }
 
     try {
-        const timestampResult = await supabase
-            .from(STROKE_EVENTS_TABLE)
-            .select('*')
-            .order('timestamp', { ascending: false, nullsFirst: false })
-            .order('id', { ascending: false })
-            .limit(11);
-
-        if (timestampResult.error) throw timestampResult.error;
-
-        const createdAtResult = await supabase
-            .from(STROKE_EVENTS_TABLE)
-            .select('*')
-            .order('created_at', { ascending: false, nullsFirst: false })
-            .order('id', { ascending: false })
-            .limit(11);
-
-        if (createdAtResult.error) {
-            console.warn('Stroke events created_at fallback skipped:', createdAtResult.error.message);
-        }
-
-        const data = dedupeStrokeEvents([
-            ...(timestampResult.data || []),
-            ...(!createdAtResult.error ? (createdAtResult.data || []) : [])
-        ])
-            .sort((a, b) => strokeEventSortTime(b) - strokeEventSortTime(a) || strokeEventSortId(b) - strokeEventSortId(a))
+        const data = (await fetchAiEventRowsFromAll({
+            limit: 11,
+            requireImage: true,
+            useAllTimeColumns: true
+        }))
+            .sort((a, b) => aiEventSortTime(b) - aiEventSortTime(a) || aiEventSortId(b) - aiEventSortId(a))
             .slice(0, 11);
 
         latestSupabaseStatus = {
@@ -1110,25 +1387,23 @@ app.get('/api/history', async (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit || 300), 1), 1000);
 
     try {
-        if (type === 'images' || type === 'stroke_event' || type === 'stroke_events') {
-            const { data, error } = await supabase
-                .from(STROKE_EVENTS_TABLE)
-                .select('*')
-                .gte('timestamp', start)
-                .lte('timestamp', end)
-                .order('timestamp', { ascending: false, nullsFirst: false })
-                .order('id', { ascending: false })
-                .limit(limit);
-
-            if (error) throw error;
+        if (type === 'images' || type === 'stroke_event' || type === 'stroke_events' || type === 'ai' || type === 'ai_alert' || type === 'ai_alerts') {
+            const rows = (await fetchAiEventRowsFromAll({
+                limit,
+                start,
+                end,
+                requireImage: true
+            }))
+                .sort((a, b) => aiEventSortTime(b) - aiEventSortTime(a) || aiEventSortId(b) - aiEventSortId(a))
+                .slice(0, limit);
 
             return res.json({
                 type: 'images',
                 range: range.key,
                 start,
                 end,
-                rows: data || [],
-                count: data?.length || 0
+                rows,
+                count: rows.length
             });
         }
 
@@ -1173,23 +1448,22 @@ app.get('/api/statistics', async (req, res) => {
     const sensorEnd = vietnamRangeTimestamp(range.end);
 
     try {
-        if (type === 'stroke_event' || type === 'stroke_events' || type === 'stroke') {
-            const { data, error } = await supabase
-                .from(STROKE_EVENTS_TABLE)
-                .select('*')
-                .gte('timestamp', start)
-                .lte('timestamp', end)
-                .order('timestamp', { ascending: true, nullsFirst: false })
-                .limit(5000);
-
-            if (error) throw error;
+        if (type === 'stroke_event' || type === 'stroke_events' || type === 'stroke' || type === 'ai' || type === 'ai_alert' || type === 'ai_alerts') {
+            const rowsByTable = await fetchAiEventRowsByTable({
+                limit: 5000,
+                start,
+                end,
+                ascending: true,
+                requireStatsAlert: true,
+                useStatsTimeColumns: true
+            });
 
             return res.json({
                 type: 'stroke_event',
                 range: range.key,
                 start,
                 end,
-                ...aggregateStrokeStats(data || [], range)
+                ...aggregateAiEventStats(rowsByTable, range)
             });
         }
 
@@ -1234,12 +1508,16 @@ app.get('/api/database/:table', requireAdmin, async (req, res) => {
     const { start, end } = req.query;
 
     try {
+        const idColumn = config.idColumn || 'id';
         let query = supabase
             .from(config.table)
             .select('*', { count: 'exact' })
             .order(config.timeColumn, { ascending: false, nullsFirst: false })
-            .order('id', { ascending: false })
             .limit(limit);
+
+        if (idColumn && idColumn !== config.timeColumn) {
+            query = query.order(idColumn, { ascending: false });
+        }
 
         query = applyDateFilters(query, config.timeColumn, start, end);
 
@@ -1248,7 +1526,10 @@ app.get('/api/database/:table', requireAdmin, async (req, res) => {
 
         res.json({
             table: config.table,
+            label: config.label || config.table,
             timeColumn: config.timeColumn,
+            idColumn,
+            isAiEvent: !!config.isAiEvent,
             rows: data || [],
             count: count || 0
         });
@@ -1275,23 +1556,24 @@ app.delete('/api/database/:table/:id', requireAdmin, async (req, res) => {
 
     try {
         let storageResult = null;
+        const idColumn = config.idColumn || 'id';
 
-        if (config.table === STROKE_EVENTS_TABLE) {
+        if (config.isAiEvent && config.storageBucket) {
             const { data: row, error: fetchError } = await supabase
                 .from(config.table)
                 .select('*')
-                .eq('id', id)
+                .eq(idColumn, id)
                 .single();
 
             if (fetchError) {
                 storageResult = { deleted: false, path: null, reason: fetchError.message };
             } else {
                 try {
-                    storageResult = await deleteStrokeEventImage(row);
+                    storageResult = await deleteAiEventImage(row, config);
                 } catch (storageError) {
                     storageResult = {
                         deleted: false,
-                        path: getStoragePathFromUrl(getStrokeImageUrl(row)),
+                        path: getStoragePathFromUrl(getAiEventImageUrl(row), config.storageBucket),
                         reason: storageError.message
                     };
                     console.warn('Storage delete failed, deleting database row anyway:', storageError.message);
@@ -1302,8 +1584,8 @@ app.delete('/api/database/:table/:id', requireAdmin, async (req, res) => {
         const { data, error } = await supabase
             .from(config.table)
             .delete()
-            .eq('id', id)
-            .select('id');
+            .eq(idColumn, id)
+            .select(idColumn);
 
         if (error) throw error;
 
